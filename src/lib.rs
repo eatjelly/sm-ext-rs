@@ -594,6 +594,14 @@ impl IShareSys {
     pub unsafe fn add_natives(&self, myself: &IExtension, natives: *const NativeInfo) {
         virtual_call!(AddNatives, self.0, myself.0, natives)
     }
+
+    pub fn register_library(&self, myself: &IExtension, name: &str) {
+        let c_name = CString::new(name).unwrap();
+
+        unsafe {
+            virtual_call!(RegisterLibrary, self.0, myself.0, c_name.as_ptr());
+        }
+    }
 }
 
 /// Error codes for SourcePawn routines.
@@ -798,6 +806,18 @@ impl IPluginContext {
 
             match res {
                 SPError::None => Ok(&mut *addr),
+                _ => Err(res),
+            }
+        }
+    }
+
+    pub fn local_to_phys_addr_ptr(&self, local: cell_t) -> Result<*mut cell_t, SPError> {
+        unsafe {
+            let mut addr: *mut cell_t = null_mut();
+            let res = virtual_call!(LocalToPhysAddr, self.0, local, &mut addr);
+
+            match res {
+                SPError::None => Ok(addr),
                 _ => Err(res),
             }
         }
@@ -1210,7 +1230,7 @@ impl IForwardManager {
 }
 
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Default)]
 pub struct HandleTypeId(c_uint);
 
 impl HandleTypeId {
@@ -1445,6 +1465,10 @@ impl<T> HandleType<T> {
     pub fn read_handle(&self, handle: HandleId, owner: IdentityTokenPtr) -> Result<Rc<T>, HandleError> {
         IHandleSys(self.iface).read_handle(self, handle, owner)
     }
+
+    pub fn read_handle_ez(&self, handle: HandleId) -> Result<T, HandleError> {
+        IHandleSys(self.iface).read_handle_ez(self, handle)
+    }
 }
 
 #[derive(Debug)]
@@ -1469,6 +1493,13 @@ impl Error for CreateHandleTypeError {
             CreateHandleTypeError::HandleError(_, err) => Some(err),
         }
     }
+}
+
+#[repr(C)]
+pub struct TypeAccess {
+    pub version: u32,
+    pub ident: IdentityTokenPtr,
+    pub access: [bool; 2], // create & inherit
 }
 
 #[repr(C)]
@@ -1504,7 +1535,7 @@ impl Default for HandleAccess {
     }
 }
 
-#[derive(Debug, SMInterfaceApi)]
+#[derive(Debug, SMInterfaceApi, Copy, Clone)]
 #[interface("IHandleSys", 5)]
 pub struct IHandleSys(IHandleSysPtr);
 
@@ -1523,6 +1554,27 @@ impl IHandleSys {
                 Err(CreateHandleTypeError::HandleError(name.into(), err))
             }
         }
+    }
+
+    pub fn find_type(&self, name: &str) -> Option<HandleTypeId> {
+        let c_name = CString::new(name).ok()?;
+        let mut outtype = HandleTypeId(0);
+
+        unsafe {
+            match virtual_call!(FindHandleType, self.0, c_name.as_ptr(), &mut outtype) {
+                true => Some(outtype),
+                false => None,
+            }
+        }
+    }
+
+    pub fn faux_type<T>(&self, id: HandleTypeId, ident: IdentityTokenPtr) -> Result<HandleType<T>, CreateHandleTypeError> {
+        Ok(HandleType {
+            iface: self.0,
+            id: id,
+            dispatch: Box::into_raw(Box::new(IHandleTypeDispatchAdapter::<T>::new())),
+            ident: ident,
+        })
     }
 
     fn remove_type<T>(&self, ty: &mut HandleType<T>) -> Result<(), bool> {
@@ -1588,6 +1640,18 @@ impl IHandleSys {
             }
         }
     }
+
+    fn read_handle_ez<T>(&self, ty: &HandleType<T>, handle: HandleId) -> Result<T, HandleError> {
+        unsafe {
+            let security = HandleSecurity::new(ty.ident, ty.ident);
+            let mut object: T = std::mem::zeroed();
+            let err = virtual_call!(ReadHandle, self.0, handle, ty.id, &security, std::mem::transmute::<&mut T, *mut *mut c_void>(&mut object));
+            match err {
+                HandleError::None => Ok(object),
+                _ => Err(err),
+            }
+        }
+    }
 }
 
 /// Describes various ways of formatting a base path.
@@ -1602,6 +1666,39 @@ pub enum PathType {
     Path_SM = 2,
     /// Base path is relative to SourceMod
     Path_SM_Rel = 3,
+}
+
+pub type ICellArrayPtr = *mut *mut ICellArrayVtable;
+
+#[vtable(ICellArrayPtr)]
+pub struct ICellArrayVtable {
+    pub size: fn() -> usize,
+    pub push: fn() -> *mut cell_t,
+    pub at: fn(index: usize) -> *mut cell_t,
+    pub blocksize: fn() -> usize,
+    pub clear: fn(),
+    pub swap: fn(item1: usize, item2: usize) -> bool,
+    pub remove: fn(index: usize),
+    pub insert_at: fn(index: usize) -> *mut cell_t,
+    pub resize: fn(newsize: usize) -> bool,
+    pub clone: fn() -> c_void, // TODO
+    pub base: fn() -> *mut cell_t,
+    pub mem_usage: fn(),
+}
+
+#[derive(Debug)]
+pub struct ICellArray(ICellArrayPtr);
+
+impl ICellArray {
+    pub fn size(&self) -> usize {
+        unsafe { virtual_call!(size, self.0) }
+    }
+    pub fn at(&self, index: usize) -> *mut cell_t {
+        unsafe { virtual_call!(at, self.0, index) }
+    }
+    pub fn blocksize(&self) -> usize {
+        unsafe { virtual_call!(blocksize, self.0) }
+    }
 }
 
 pub type GameFrameHookFunc = unsafe extern "C" fn(simulating: bool);
