@@ -493,7 +493,7 @@ pub fn native(_attr: proc_macro::TokenStream, item: proc_macro::TokenStream) -> 
     let wrapper_ident = &input.sig.ident;
     let callback_ident = format_ident!("__{}_impl", wrapper_ident);
     output.extend(quote! {
-        unsafe extern "C" fn #wrapper_ident(ctx: sm_ext::IPluginContextPtr, args: *const sm_ext::cell_t) -> sm_ext::cell_t {
+        pub unsafe extern "C" fn #wrapper_ident(ctx: sm_ext::IPluginContextPtr, args: *const sm_ext::cell_t) -> sm_ext::cell_t {
             sm_ext::safe_native_invoke(ctx, |ctx| -> Result<sm_ext::cell_t, Box<dyn std::error::Error>> {
                 use sm_ext::NativeResult;
                 use sm_ext::TryIntoPlugin;
@@ -797,6 +797,7 @@ pub fn vtable(attr: proc_macro::TokenStream, item: proc_macro::TokenStream) -> p
 
     input.attrs.push(syn::parse_quote!(#[doc(hidden)]));
     input.attrs.push(syn::parse_quote!(#[repr(C)]));
+    input.attrs.push(syn::parse_quote!(#[derive(Copy, Clone)]));
 
     let mut did_error = false;
     for field in &mut input.fields {
