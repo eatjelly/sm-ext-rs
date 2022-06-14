@@ -84,6 +84,18 @@ where
     }
 }
 
+impl From<bool> for cell_t {
+    fn from(x: bool) -> Self {
+        cell_t(if x { 1 } else { 0 })
+    }
+}
+
+impl From<cell_t> for bool {
+    fn from(x: cell_t) -> Self {
+        if x.0 != 0 { true } else { false }
+    }
+}
+
 impl From<i32> for cell_t {
     fn from(x: i32) -> Self {
         cell_t(x)
@@ -93,6 +105,18 @@ impl From<i32> for cell_t {
 impl From<cell_t> for i32 {
     fn from(x: cell_t) -> Self {
         x.0
+    }
+}
+
+impl From<usize> for cell_t {
+    fn from(x: usize) -> Self {
+        cell_t(x as i32)
+    }
+}
+
+impl From<cell_t> for usize {
+    fn from(x: cell_t) -> Self {
+        x.0 as usize
     }
 }
 
@@ -1441,6 +1465,7 @@ pub struct HandleType<T> {
 
 impl<T> Drop for HandleType<T> {
     fn drop(&mut self) {
+        if self.iface.is_null() { return }
         IHandleSys(self.iface).remove_type(self).unwrap();
 
         unsafe {
