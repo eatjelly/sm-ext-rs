@@ -1,6 +1,7 @@
 #![cfg_attr(feature = "abi_thiscall", feature(abi_thiscall))]
 #![allow(non_snake_case, non_camel_case_types, unused_variables)]
-//! This interface is extremely unstable, everything just lives in a soup at the top level for now.
+#![allow(dead_code)]
+//! This interface is extremely unstable, everythi&&ng just lives in a soup at the top level for now.
 
 use std::convert::TryFrom;
 use std::error::Error;
@@ -9,6 +10,8 @@ use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
 use std::str::Utf8Error;
+use std::io::Read;
+use std::mem::transmute;
 
 pub use c_str_macro::c_str;
 pub use libc::size_t;
@@ -109,15 +112,19 @@ impl From<cell_t> for i32 {
 }
 
 impl From<usize> for cell_t {
-    fn from(x: usize) -> Self {
-        cell_t(x as i32)
-    }
+    fn from(x: usize) -> Self { cell_t(x as i32) }
 }
 
 impl From<cell_t> for usize {
-    fn from(x: cell_t) -> Self {
-        x.0 as usize
-    }
+    fn from(x: cell_t) -> Self { x.0 as usize }
+}
+
+impl From<u32> for cell_t {
+    fn from(x: u32) -> Self { cell_t(x as i32) }
+}
+
+impl From<cell_t> for u32 {
+    fn from(x: cell_t) -> Self { x.0 as u32 }
 }
 
 impl From<f32> for cell_t {
@@ -137,6 +144,22 @@ impl<'ctx> TryFromPlugin<'ctx> for &'ctx CStr {
 
     fn try_from_plugin(ctx: &'ctx IPluginContext, value: cell_t) -> Result<Self, Self::Error> {
         Ok(ctx.local_to_string(value)?)
+    }
+}
+
+impl<'ctx> TryFromPlugin<'ctx> for *const c_char {
+    type Error = SPError;
+
+    fn try_from_plugin(ctx: &'ctx IPluginContext, value: cell_t) -> Result<Self, Self::Error> {
+        Ok(ctx.local_to_string_ptr(value)?)
+    }
+}
+
+impl<'ctx> TryFromPlugin<'ctx> for *mut c_char {
+    type Error = SPError;
+
+    fn try_from_plugin(ctx: &'ctx IPluginContext, value: cell_t) -> Result<Self, Self::Error> {
+        Ok(ctx.local_to_string_ptr(value)?)
     }
 }
 
@@ -173,6 +196,26 @@ impl<'ctx> TryFromPlugin<'ctx> for &'ctx mut f32 {
     fn try_from_plugin(ctx: &'ctx IPluginContext, value: cell_t) -> Result<Self, Self::Error> {
         let cell: &mut cell_t = value.try_into_plugin(ctx)?;
         unsafe { Ok(&mut *(cell as *mut cell_t as *mut f32)) }
+    }
+}
+
+impl<'ctx> TryFromPlugin<'ctx> for &'ctx mut [f32; 3] {
+    type Error = SPError;
+
+    fn try_from_plugin(ctx: &'ctx IPluginContext, value: cell_t) -> Result<Self, Self::Error> {
+        let cell: &mut cell_t = value.try_into_plugin(ctx)?;
+        unsafe {
+            Ok(transmute::<*mut cell_t, &mut [f32; 3]>(ctx.local_to_phys_addr(value)? as *mut cell_t))
+        }
+    }
+}
+
+impl<'ctx> TryFromPlugin<'ctx> for &'ctx mut i64 {
+    type Error = SPError;
+
+    fn try_from_plugin(ctx: &'ctx IPluginContext, value: cell_t) -> Result<Self, Self::Error> {
+        let cell: &mut cell_t = value.try_into_plugin(ctx)?;
+        unsafe { Ok(&mut *(cell as *mut cell_t as *mut i64)) }
     }
 }
 
@@ -587,7 +630,7 @@ impl Error for RequestInterfaceError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct IShareSys(IShareSysPtr);
 
 impl IShareSys {
@@ -769,8 +812,8 @@ pub struct IPluginContextVtable {
     _GetPubVarsNum: fn(),
     pub LocalToPhysAddr: fn(local_addr: cell_t, phys_addr: *mut *mut cell_t) -> SPError,
     pub LocalToString: fn(local_addr: cell_t, addr: *mut *mut c_char) -> SPError,
-    _StringToLocal: fn(),
-    _StringToLocalUTF8: fn(),
+    pub StringToLocal: fn(local_addr: cell_t, bytes: usize, source: *const c_char) -> SPError,
+    pub StringToLocalUTF8: fn(local_addr: cell_t, maxbytes: usize, source: *const c_char, wrtnbytes: *mut usize) -> SPError,
     _PushCell: fn(),
     _PushCellArray: fn(),
     _PushString: fn(),
@@ -835,10 +878,22 @@ impl IPluginContext {
         }
     }
 
-    pub fn local_to_phys_addr_ptr(&self, local: cell_t) -> Result<*mut cell_t, SPError> {
+    pub fn local_to_string(&self, local: cell_t) -> Result<&CStr, SPError> {
         unsafe {
-            let mut addr: *mut cell_t = null_mut();
-            let res = virtual_call!(LocalToPhysAddr, self.0, local, &mut addr);
+            let mut addr: *mut c_char = null_mut();
+            let res = virtual_call!(LocalToString, self.0, local, &mut addr);
+
+            match res {
+                SPError::None => Ok(CStr::from_ptr(addr)),
+                _ => Err(res),
+            }
+        }
+    }
+
+    pub fn local_to_string_ptr(&self, local: cell_t) -> Result<*mut c_char, SPError> {
+        unsafe {
+            let mut addr: *mut c_char = null_mut();
+            let res = virtual_call!(LocalToString, self.0, local, &mut addr);
 
             match res {
                 SPError::None => Ok(addr),
@@ -847,13 +902,24 @@ impl IPluginContext {
         }
     }
 
-    pub fn local_to_string(&self, local: cell_t) -> Result<&CStr, SPError> {
+    pub fn string_to_local(&self, local: cell_t, bytes: usize, source: *const c_char) -> Result<(), SPError> {
         unsafe {
-            let mut addr: *mut c_char = null_mut();
-            let res = virtual_call!(LocalToString, self.0, local, &mut addr);
+            let res = virtual_call!(StringToLocal, self.0, local, bytes, source);
 
             match res {
-                SPError::None => Ok(CStr::from_ptr(addr)),
+                SPError::None => Ok(()),
+                _ => Err(res),
+            }
+        }
+    }
+
+    pub fn string_to_local_utf8(&self, local: cell_t, maxbytes: usize, source: *const c_char) -> Result<usize, SPError> {
+        unsafe {
+            let mut wrtnbytes = 0usize;
+            let res = virtual_call!(StringToLocalUTF8, self.0, local, maxbytes, source, &mut wrtnbytes);
+
+            match res {
+                SPError::None => Ok(wrtnbytes),
                 _ => Err(res),
             }
         }
@@ -1358,9 +1424,9 @@ pub type IHandleTypeDispatchPtr = *mut *mut IHandleTypeDispatchVtable;
 
 #[vtable(IHandleTypeDispatchPtr)]
 pub struct IHandleTypeDispatchVtable {
-    pub GetDispatchVersion: fn() -> c_uint,
-    pub OnHandleDestroy: fn(ty: HandleTypeId, object: *mut c_void) -> (),
-    pub GetHandleApproxSize: fn(ty: HandleTypeId, object: *mut c_void, size: *mut c_uint) -> bool,
+    pub GetDispatchVersion: unsafe extern "thiscall" fn() -> c_uint,
+    pub OnHandleDestroy: unsafe extern "thiscall" fn(ty: HandleTypeId, object: *mut c_void) -> (),
+    pub GetHandleApproxSize: unsafe extern "thiscall" fn(ty: HandleTypeId, object: *mut c_void, size: *mut c_uint) -> bool,
 }
 
 #[repr(C)]
@@ -1379,23 +1445,30 @@ impl<T> Drop for IHandleTypeDispatchAdapter<T> {
 
 impl<T> Default for IHandleTypeDispatchAdapter<T> {
     fn default() -> Self {
-        Self::new()
+        Self::new(IHandleTypeDispatchVtable {
+            GetDispatchVersion: IHandleTypeDispatchAdapter::<T>::get_dispatch_version,
+            OnHandleDestroy: IHandleTypeDispatchAdapter::<T>::on_handle_destroy,
+            GetHandleApproxSize: IHandleTypeDispatchAdapter::<T>::get_handle_approx_size,
+        })
     }
 }
 
 impl<T> IHandleTypeDispatchAdapter<T> {
-    pub fn new() -> IHandleTypeDispatchAdapter<T> {
-        let vtable = IHandleTypeDispatchVtable {
-            GetDispatchVersion: IHandleTypeDispatchAdapter::<T>::get_dispatch_version,
-            OnHandleDestroy: IHandleTypeDispatchAdapter::<T>::on_handle_destroy,
-            GetHandleApproxSize: IHandleTypeDispatchAdapter::<T>::get_handle_approx_size,
-        };
+    pub fn new(vtable: IHandleTypeDispatchVtable) -> IHandleTypeDispatchAdapter<T> {
+        // let vtable = IHandleTypeDispatchVtable {
+        //     GetDispatchVersion: IHandleTypeDispatchAdapter::<T>::get_dispatch_version,
+        //     OnHandleDestroy: match droptype {
+        //         DropType::RcRefCell => Self::on_handle_destroy,
+        //         DropType::Box => Self::on_handle_destroy_box,
+        //     },
+        //     GetHandleApproxSize: IHandleTypeDispatchAdapter::<T>::get_handle_approx_size,
+        // };
 
         IHandleTypeDispatchAdapter { vtable: Box::into_raw(Box::new(vtable)), phantom: std::marker::PhantomData }
     }
 
     #[vtable_override]
-    unsafe fn get_dispatch_version(this: IHandleTypeDispatchPtr) -> u32 {
+    pub unsafe fn get_dispatch_version(this: IHandleTypeDispatchPtr) -> u32 {
         <IHandleSys as RequestableInterface>::get_interface_version()
     }
 
@@ -1475,7 +1548,7 @@ impl<T> Drop for HandleType<T> {
 }
 
 impl<T> HandleType<T> {
-    pub fn create_handle(&self, object: Rc<T>, owner: IdentityTokenPtr, access: Option<&HandleAccess>) -> Result<HandleId, HandleError> {
+    pub fn create_handle(&self, object: *mut c_void, owner: IdentityTokenPtr, access: Option<&HandleAccess>) -> Result<HandleId, HandleError> {
         IHandleSys(self.iface).create_handle(self, object, owner, access)
     }
 
@@ -1487,12 +1560,12 @@ impl<T> HandleType<T> {
         IHandleSys(self.iface).free_handle(self, handle, owner)
     }
 
-    pub fn read_handle(&self, handle: HandleId, owner: IdentityTokenPtr) -> Result<Rc<T>, HandleError> {
-        IHandleSys(self.iface).read_handle(self, handle, owner)
+    pub fn free_handle_ez(&self, handle: HandleId, owner: IdentityTokenPtr) -> Result<(), HandleError> {
+        IHandleSys(self.iface).free_handle_ez(self, handle, owner)
     }
 
-    pub fn read_handle_ez(&self, handle: HandleId) -> Result<T, HandleError> {
-        IHandleSys(self.iface).read_handle_ez(self, handle)
+    pub fn read_handle(&self, handle: HandleId, owner: IdentityTokenPtr) -> Result<*mut c_void, HandleError> {
+        IHandleSys(self.iface).read_handle(self, handle, owner)
     }
 }
 
@@ -1560,15 +1633,41 @@ impl Default for HandleAccess {
     }
 }
 
+#[repr(C)]
+#[allow(non_snake_case)]
+struct QHandleType {
+    dispatch: *const c_void,
+    freeID: u32,
+    children: u32,
+    typeSec: TypeAccess,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct HandleSystem {
+    vtable: *const c_void,
+    m_Handles: *const c_void,
+    m_Types: *const QHandleType,
+}
+
+/*
+#[cfg(target_os = "linux")]
+#[link(kind="dylib", name="sourcemod.logic")]
+extern "C" {
+    #[no_mangle]
+    pub static g_pCoreIdent: *const c_void;
+}
+*/
+
 #[derive(Debug, SMInterfaceApi, Copy, Clone)]
 #[interface("IHandleSys", 5)]
 pub struct IHandleSys(IHandleSysPtr);
 
 impl IHandleSys {
-    pub fn create_type<T>(&self, name: &str, handle_access: Option<&HandleAccess>, ident: IdentityTokenPtr) -> Result<HandleType<T>, CreateHandleTypeError> {
+    pub fn create_type<T>(&self, name: &str, handle_access: Option<&HandleAccess>, ident: IdentityTokenPtr, dispatch: IHandleTypeDispatchVtable) -> Result<HandleType<T>, CreateHandleTypeError> {
         unsafe {
             let c_name = CString::new(name).map_err(CreateHandleTypeError::InvalidName)?;
-            let dispatch = Box::into_raw(Box::new(IHandleTypeDispatchAdapter::<T>::new()));
+            let dispatch = Box::into_raw(Box::new(IHandleTypeDispatchAdapter::<T>::new(dispatch)));
 
             let mut err: HandleError = HandleError::None;
             let id = virtual_call!(CreateType, self.0, c_name.as_ptr(), dispatch as IHandleTypeDispatchPtr, HandleTypeId::invalid(), null(), handle_access, ident, &mut err);
@@ -1593,11 +1692,17 @@ impl IHandleSys {
         }
     }
 
+    // g_pCoreIdent
+    pub fn core_ident(&self) -> IdentityTokenPtr {
+        let blah = unsafe { transmute::<Self, *const HandleSystem>(*self) };
+        unsafe { (*(*blah).m_Types.offset(512)).typeSec.ident } // still no idea why 512...
+    }
+
     pub fn faux_type<T>(&self, id: HandleTypeId, ident: IdentityTokenPtr) -> Result<HandleType<T>, CreateHandleTypeError> {
         Ok(HandleType {
             iface: self.0,
             id: id,
-            dispatch: Box::into_raw(Box::new(IHandleTypeDispatchAdapter::<T>::new())),
+            dispatch: Box::into_raw(Box::new(IHandleTypeDispatchAdapter::<T>::default())),
             ident: ident,
         })
     }
@@ -1612,9 +1717,22 @@ impl IHandleSys {
         }
     }
 
-    fn create_handle<T>(&self, ty: &HandleType<T>, object: Rc<T>, owner: IdentityTokenPtr, access: Option<&HandleAccess>) -> Result<HandleId, HandleError> {
+    // fn create_handle<T>(&self, ty: &HandleType<T>, object: T, owner: IdentityTokenPtr, access: Option<&HandleAccess>) -> Result<HandleId, HandleError> {
+    //     unsafe {
+    //         let object = Rc::into_raw(object) as *mut c_void;
+    //         let security = HandleSecurity::new(owner, ty.ident);
+    //         let mut err: HandleError = HandleError::None;
+    //         let id = virtual_call!(CreateHandleEx, self.0, ty.id, object, &security, access, &mut err);
+    //         if id.is_valid() {
+    //             Ok(id)
+    //         } else {
+    //             Err(err)
+    //         }
+    //     }
+    // }
+
+    fn create_handle<T>(&self, ty: &HandleType<T>, object: *mut c_void, owner: IdentityTokenPtr, access: Option<&HandleAccess>) -> Result<HandleId, HandleError> {
         unsafe {
-            let object = Rc::into_raw(object) as *mut c_void;
             let security = HandleSecurity::new(owner, ty.ident);
             let mut err: HandleError = HandleError::None;
             let id = virtual_call!(CreateHandleEx, self.0, ty.id, object, &security, access, &mut err);
@@ -1626,9 +1744,34 @@ impl IHandleSys {
         }
     }
 
+    // fn create_handle_box<T>(&self, ty: &HandleType<T>, object: T, owner: IdentityTokenPtr, access: Option<&HandleAccess>) -> Result<HandleId, HandleError> {
+    //     unsafe {
+    //         let object = Box::into_raw(Box::new(object)) as *mut c_void;
+    //         let security = HandleSecurity::new(owner, ty.ident);
+    //         let mut err: HandleError = HandleError::None;
+    //         let id = virtual_call!(CreateHandleEx, self.0, ty.id, object, &security, access, &mut err);
+    //         if id.is_valid() {
+    //             Ok(id)
+    //         } else {
+    //             Err(err)
+    //         }
+    //     }
+    // }
+
     fn free_handle<T>(&self, ty: &HandleType<T>, handle: HandleId, owner: IdentityTokenPtr) -> Result<(), HandleError> {
         unsafe {
             let security = HandleSecurity::new(owner, ty.ident);
+            let err = virtual_call!(FreeHandle, self.0, handle, &security);
+            match err {
+                HandleError::None => Ok(()),
+                _ => Err(err),
+            }
+        }
+    }
+
+    fn free_handle_ez<T>(&self, ty: &HandleType<T>, handle: HandleId, owner: IdentityTokenPtr) -> Result<(), HandleError> {
+        unsafe {
+            let security = HandleSecurity::new(owner, owner);
             let err = virtual_call!(FreeHandle, self.0, handle, &security);
             match err {
                 HandleError::None => Ok(()),
@@ -1649,34 +1792,38 @@ impl IHandleSys {
         }
     }
 
-    fn read_handle<T>(&self, ty: &HandleType<T>, handle: HandleId, owner: IdentityTokenPtr) -> Result<Rc<T>, HandleError> {
+    fn read_handle<T>(&self, ty: &HandleType<T>, handle: HandleId, owner: IdentityTokenPtr) -> Result<*mut c_void, HandleError> {
         unsafe {
             let security = HandleSecurity::new(owner, ty.ident);
             let mut object: *mut c_void = null_mut();
             let err = virtual_call!(ReadHandle, self.0, handle, ty.id, &security, &mut object);
             match err {
-                HandleError::None => Ok({
-                    // https://github.com/rust-lang/rust/issues/48108
-                    let object = Rc::from_raw(object as *mut T);
-                    std::mem::forget(object.clone());
-                    object
-                }),
-                _ => Err(err),
-            }
-        }
-    }
-
-    fn read_handle_ez<T>(&self, ty: &HandleType<T>, handle: HandleId) -> Result<T, HandleError> {
-        unsafe {
-            let security = HandleSecurity::new(ty.ident, ty.ident);
-            let mut object: T = std::mem::zeroed();
-            let err = virtual_call!(ReadHandle, self.0, handle, ty.id, &security, std::mem::transmute::<&mut T, *mut *mut c_void>(&mut object));
-            match err {
+                // HandleError::None => Ok({
+                //     // https://github.com/rust-lang/rust/issues/48108
+                //     let object = Rc::from_raw(object as *mut T);
+                //     std::mem::forget(object.clone());
+                //     object
+                // }),
                 HandleError::None => Ok(object),
                 _ => Err(err),
             }
         }
     }
+
+    // fn read_handle_box<T>(&self, ty: &HandleType<T>, handle: HandleId, owner: IdentityTokenPtr) -> Result<*mut T, HandleError> {
+    //     unsafe {
+    //         let security = HandleSecurity::new(owner, ty.ident);
+    //         let mut object: *mut c_void = null_mut();
+    //         let err = virtual_call!(ReadHandle, self.0, handle, ty.id, &security, &mut object);
+    //         match err {
+    //             HandleError::None => Ok({
+    //                 let object = Box::from_raw(object as *mut T);
+    //                 Box::leak(object) as *mut T
+    //             }),
+    //             _ => Err(err),
+    //         }
+    //     }
+    // }
 }
 
 /// Describes various ways of formatting a base path.
@@ -1706,23 +1853,213 @@ pub struct ICellArrayVtable {
     pub remove: fn(index: usize),
     pub insert_at: fn(index: usize) -> *mut cell_t,
     pub resize: fn(newsize: usize) -> bool,
-    pub clone: fn() -> c_void, // TODO
+    pub clone: fn() -> *mut CellArray,
     pub base: fn() -> *mut cell_t,
     pub mem_usage: fn(),
 }
 
+#[repr(C)]
 #[derive(Debug)]
-pub struct ICellArray(ICellArrayPtr);
+pub struct CellArray {
+    pub vtable: ICellArrayPtr,
+    pub m_Data: *mut cell_t,
+    pub m_BlockSize: usize,
+    pub m_AllocSize: usize,
+    pub m_Size: usize,
+}
 
-impl ICellArray {
-    pub fn size(&self) -> usize {
-        unsafe { virtual_call!(size, self.0) }
+impl CellArray {
+    pub fn to_cells<'a>(&mut self) -> &'a mut [cell_t] {
+        unsafe { std::slice::from_raw_parts_mut(self.m_Data, self.m_Size*self.m_BlockSize) }
     }
-    pub fn at(&self, index: usize) -> *mut cell_t {
-        unsafe { virtual_call!(at, self.0, index) }
+    pub fn to_bytes<'a>(&mut self) -> &'a mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(
+            std::mem::transmute::<*mut cell_t, *mut u8>(self.m_Data),
+            self.m_AllocSize * 4
+        ) }
     }
-    pub fn blocksize(&self) -> usize {
-        unsafe { virtual_call!(blocksize, self.0) }
+    pub fn set_array(&mut self, index: usize, arr: &[cell_t]) -> Option<()> {
+        let this = unsafe { transmute::<&mut Self, ICellArrayPtr>(self) };
+        let ptr = self.at(index);
+        if ptr.is_null() { return None; }
+        unsafe { ptr.copy_from_nonoverlapping(arr.as_ptr(), std::cmp::min(self.m_BlockSize, arr.len())) };
+        Some(())
+    }
+    pub fn push_array(&mut self, arr: &[cell_t]) -> Option<()> {
+        let ptr = self.push()?;
+        unsafe { ptr.copy_from_nonoverlapping(arr.as_ptr(), std::cmp::min(self.m_BlockSize, arr.len())) };
+        Some(())
+    }
+    pub fn push_string(&mut self, s: &str) -> Option<()> {
+        let copy_size = std::cmp::min(self.m_BlockSize*4 - 1, s.len());
+
+        unsafe {
+            let ptr = transmute::<*mut cell_t, *mut u8>(self.push()?);
+            ptr.copy_from_nonoverlapping(s.as_ptr(), copy_size);
+            *ptr.add(s.len()) = 0;
+        };
+
+        Some(())
+    }
+    pub fn push(&mut self) -> Option<*mut cell_t> {
+        let this = unsafe { transmute::<&mut Self, ICellArrayPtr>(self) };
+        let ptr = unsafe { virtual_call!(push, this) };
+        if ptr.is_null() { None } else { Some(ptr) }
+    }
+    pub fn free(&mut self) {
+        // todo: idk if this'll even work... differing libc versions will probably fuck this up
+        unsafe { libc::free(self.m_Data as *mut c_void) }
+    }
+    pub fn clone(&mut self) -> *mut CellArray {
+        let this = unsafe { transmute::<&mut Self, ICellArrayPtr>(self) };
+        unsafe { virtual_call!(clone, this) }
+        //unsafe { ((*self.vtable).clone)(self) }
+    }
+    pub fn size(&mut self) -> usize {
+        let this = unsafe { transmute::<&mut Self, ICellArrayPtr>(self) };
+        unsafe { virtual_call!(size, this) }
+    }
+    pub fn at(&mut self, index: usize) -> *mut cell_t {
+        let this = unsafe { transmute::<&mut Self, ICellArrayPtr>(self) };
+        unsafe { virtual_call!(at, this, index) }
+    }
+    pub fn blocksize(&mut self) -> usize {
+        let this = unsafe { transmute::<&mut Self, ICellArrayPtr>(self) };
+        unsafe { virtual_call!(blocksize, this) }
+    }
+    pub fn resize(&mut self, newsize: usize) -> Option<()> {
+        let this = unsafe { transmute::<&mut Self, ICellArrayPtr>(self) };
+        unsafe { virtual_call!(resize, this, newsize) }.then(|| ())
+    }
+}
+
+pub type IFileObjectPtr = *mut *mut IFileObjectVtable;
+
+#[vtable(IFileObjectPtr)]
+pub struct IFileObjectVtable {
+    _Destructor: fn() -> (),
+    #[cfg(not(windows))]
+    _Destructor2: fn() -> (), // not positive about this...
+    pub Read: fn(buf: *mut u8, size: usize) -> usize,
+    pub ReadLine: fn(buf: *mut u8, size: usize) -> *mut c_char,
+    pub Write: fn(buf: *const u8, size: usize) -> usize,
+    pub Seek: fn(pos: usize, seek_type: i32) -> bool,
+    pub Tell: fn() -> usize,
+    pub Flush: fn() -> bool,
+    pub HasError: fn() -> bool,
+    pub EndOfFile: fn() -> bool,
+    pub Close: fn(),
+    pub AsValveFile: fn() -> *mut c_void,
+    pub AsSystemFile: fn() -> *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct FileObject {
+    pub vtable: IFileObjectPtr,
+    pub filehandle: *mut c_void,
+}
+
+impl FileObject {
+    pub fn Read(&mut self, buf: *mut u8, size: usize) -> usize {
+        let this = unsafe { transmute::<&mut Self, IFileObjectPtr>(self) };
+        unsafe { virtual_call!(Read, this, buf, size) }
+    }
+    pub fn ReadLine(&mut self, buf: *mut u8, size: usize) -> *mut c_char {
+        let this = unsafe { transmute::<&mut Self, IFileObjectPtr>(self) };
+        unsafe { virtual_call!(ReadLine, this, buf, size) }
+    }
+    pub fn Write(&mut self, buf: *const u8, size: usize) -> usize {
+        let this = unsafe { transmute::<&mut Self, IFileObjectPtr>(self) };
+        unsafe { virtual_call!(Write, this, buf, size) }
+    }
+    /*
+    #define SEEK_SET 0              /**< Seek from start. */
+    #define SEEK_CUR 1              /**< Seek from current position. */
+    #define SEEK_END 2              /**< Seek from end position. */
+    */
+    pub fn Seek(&mut self, pos: usize, seek_type: i32) -> bool {
+        let this = unsafe { transmute::<&mut Self, IFileObjectPtr>(self) };
+        unsafe { virtual_call!(Seek, this, pos, seek_type) }
+    }
+    pub fn Tell(&mut self) -> usize {
+        let this = unsafe { transmute::<&mut Self, IFileObjectPtr>(self) };
+        unsafe { virtual_call!(Tell, this) }
+    }
+    pub fn Flush(&mut self) -> bool {
+        let this = unsafe { transmute::<&mut Self, IFileObjectPtr>(self) };
+        unsafe { virtual_call!(Flush, this) }
+    }
+    pub fn HasError(&mut self) -> bool {
+        let this = unsafe { transmute::<&mut Self, IFileObjectPtr>(self) };
+        unsafe { virtual_call!(HasError, this) }
+    }
+    pub fn EndOfFile(&mut self) -> bool {
+        let this = unsafe { transmute::<&mut Self, IFileObjectPtr>(self) };
+        unsafe { virtual_call!(EndOfFile, this) }
+    }
+}
+
+/*
+pub type IFileObjectPtr = *mut *mut IFileObjectVtable;
+pub type IFileObjectPtrThis<'a> = &'a &'a FileObject;
+
+#[vtable(IFileObjectPtrThis)]
+pub struct IFileObjectVtable {
+    _Destructor: fn() -> (),
+    #[cfg(not(windows))]
+    _Destructor2: fn() -> (), // not positive about this...
+    pub Read: fn(buf: *mut u8, size: usize) -> usize,
+    pub ReadLine: fn(buf: *mut u8, size: usize) -> *mut c_char,
+    pub Write: fn(buf: *const u8, size: usize) -> usize,
+    pub Seek: fn(pos: usize, seek_type: i32) -> bool,
+    pub Tell: fn() -> usize,
+    pub Flush: fn() -> bool,
+    pub HasError: fn() -> bool,
+    pub EndOfFile: fn() -> bool,
+    pub Close: fn(),
+    pub AsValveFile: fn() -> *mut c_void,
+    pub AsSystemFile: fn() -> *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct FileObject {
+    pub vtable: IFileObjectPtr,
+    pub filehandle: *mut c_void,
+}
+
+impl FileObject {
+    pub fn Read(&self, buf: *mut u8, size: usize) -> usize {
+        unsafe { virtual_call222!(Read, self.vtable, &self, buf, size) }
+    }
+    pub fn ReadLine(&self, buf: *mut u8, size: usize) -> *mut c_char {
+        unsafe { virtual_call222!(ReadLine, self.vtable, &self, buf, size) }
+    }
+    pub fn Write(&self, buf: *const u8, size: usize) -> usize {
+        unsafe { virtual_call222!(Write, self.vtable, &self, buf, size) }
+    }
+    pub fn Seek(&self, pos: usize, seek_type: i32) -> bool {
+        unsafe { virtual_call222!(Seek, self.vtable, &self, pos, seek_type) }
+    }
+    pub fn Tell(&self) -> usize {
+        unsafe { virtual_call222!(Tell, self.vtable, &self, ) }
+    }
+    pub fn Flush(&self) -> bool {
+        unsafe { virtual_call222!(Flush, self.vtable, &self, ) }
+    }
+    pub fn HasError(&self) -> bool {
+        unsafe { virtual_call222!(HasError, self.vtable, &self, ) }
+    }
+    pub fn EndOfFile(&self) -> bool {
+        unsafe { virtual_call222!(EndOfFile, self.vtable, &self, ) }
+    }
+}
+*/
+
+impl Read for FileObject {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Ok(self.Read(buf.as_mut_ptr(), buf.len()))
     }
 }
 
@@ -1767,7 +2104,7 @@ pub struct ISourceModVtable {
     pub ToPseudoAddress: fn(addr: *mut c_void) -> u32,
 }
 
-#[derive(Debug, SMInterfaceApi)]
+#[derive(Debug, SMInterfaceApi, Copy, Clone)]
 #[interface("ISourceMod", 14)]
 pub struct ISourceMod(ISourceModPtr);
 
@@ -1784,7 +2121,32 @@ unsafe extern "C" fn frame_action_trampoline<F: FnMut() + 'static>(func: *mut c_
     (*func)()
 }
 
+#[cfg(windows)]
+pub const PATH_MAX: usize = 260;
+#[cfg(not(windows))]
+pub const PATH_MAX: usize = 4096;
+
 impl ISourceMod {
+    pub fn build_path_ez(&self, ty: PathType, path: *const c_char) -> Result<std::ffi::OsString, std::str::Utf8Error> {
+        let mut built_path: [i8; PATH_MAX] = [0; PATH_MAX];
+        let _bytes_written = self.build_path(ty, &mut built_path, path);
+        Ok(std::ffi::OsString::from(unsafe { CStr::from_ptr(built_path.as_ptr()) }.to_str()?))
+    }
+
+    pub fn build_path(&self, ty: PathType, buf: &mut [i8], path: *const c_char) -> size_t {
+        unsafe {
+            virtual_call_varargs!(
+                BuildPath,
+                self.0,
+                ty,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+                c_str!("%s").as_ptr(),
+                path
+            )
+        }
+    }
+
     pub fn log_message(&self, myself: &IExtension, msg: String) {
         let fmt = c_str!("%s");
         let msg = CString::new(msg).expect("log message contained NUL byte");
