@@ -87,6 +87,34 @@ where
     }
 }
 
+pub fn try_into_plugin_box<T>(
+    object: T,
+    ctx: &IPluginContext,
+    asdf: &HandleType<T>,
+) -> Result<cell_t, HandleError> {
+    let object = Box::into_raw(Box::new(object)) as *mut c_void;
+    let res = asdf.create_handle(object, ctx.get_identity(), None);
+    match res {
+        Ok(handleid) => Ok(handleid.into()),
+        Err(e) => {
+            unsafe { drop(Box::from_raw(object as *mut T)) };
+            Err(e)
+        },
+    }
+}
+
+pub fn try_from_plugin_box<'ctx, T>(
+    ctx: &'ctx IPluginContext,
+    value: cell_t,
+    asdf: &HandleType<T>,
+) -> Result<&'ctx mut T, HandleError> {
+    unsafe {
+        let object = asdf.read_handle(HandleId::from(value), ctx.get_identity())?;
+        let object = Box::from_raw(object as *mut T);
+        Ok(Box::leak(object))
+    }
+}
+
 impl From<bool> for cell_t {
     fn from(x: bool) -> Self {
         cell_t(if x { 1 } else { 0 })
@@ -1266,7 +1294,7 @@ impl Error for CreateForwardError {
     }
 }
 
-#[derive(Debug, SMInterfaceApi)]
+#[derive(Copy, Clone, Debug, SMInterfaceApi)]
 #[interface("IForwardManager", 4)]
 pub struct IForwardManager(IForwardManagerPtr);
 
